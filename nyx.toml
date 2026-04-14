@@ -1,0 +1,15 @@
+[package]
+name = "nyx-queue"
+version = "0.2.0"
+main = "examples/standalone.nx"
+description = "Persistent RESP2 message queue library: ENQUEUE/DEQUEUE/ACK with redelivery"
+
+# nyx-queue is a library (src/*.nx) consumed as a package by projects
+# that want to embed a message queue. examples/standalone.nx is a full
+# runnable daemon with --port, --ack-timeout, --rate-limit flags that
+# `make build` compiles as a reference binary and the product test
+# runner uses to drive the test suite. See sibling products proxy, serve
+# and kv for the v0.13 library pattern and services/gateway/,
+# services/nyxkv/ for example consumers.
+
+[dependencies]
