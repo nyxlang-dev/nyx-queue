@@ -1,0 +1,40 @@
+// limits.nx — Rate limiting for nyx-queue
+// Per-IP sliding window rate limiter.
+// Enabled by default; disable with --no-rate-limit CLI flag.
+
+// Max requests per second per IP (configurable via --rate-limit N)
+var QUEUE_RATE_LIMIT: int = 500
+
+// Rate limit enabled flag (set to 0 with --no-rate-limit)
+var g_rate_enabled: int = 1
+
+// Rate limit tracking maps (per-IP)
+var g_rate_ts: Map = Map.new()
+var g_rate_count: Map = Map.new()
+
+// Initialize rate limit maps (call from main before spawning threads)
+pub fn init_queue_limits() {
+    g_rate_ts = Map.new()
+    g_rate_count = Map.new()
+}
+
+// Check rate limit for IP. Returns "" if OK, RESP error if exceeded.
+pub fn queue_check_rate(ip: String) -> String {
+    if g_rate_enabled == 0 { return "" }
+    let now: int = time_us()
+    if g_rate_ts.contains(ip) {
+        let last_ts: int = g_rate_ts.get(ip)
+        let elapsed: int = now - last_ts
+        if elapsed < 1000000 {
+            let count: int = g_rate_count.get(ip)
+            if count >= QUEUE_RATE_LIMIT {
+                return "-ERR rate limit exceeded\r\n"
+            }
+            g_rate_count.insert(ip, count + 1)
+            return ""
+        }
+    }
+    g_rate_ts.insert(ip, now)
+    g_rate_count.insert(ip, 1)
+    return ""
+}

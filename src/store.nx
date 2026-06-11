@@ -1,0 +1,450 @@
+// store.nx — In-memory message queue store for nyx-queue
+//
+// Each queue is an ordered list of messages.
+// Messages have: id, payload, status (0=pending, 1=delivered, 2=acked),
+//                delivery_time (when delivered), deliver_to (consumer fd)
+//
+// Uses flat encoding to avoid nested Maps (same pattern as nyx-kv).
+
+import "std/random"
+
+// Global state
+var g_queues: Map = Map.new()          // queue_name -> 1 (existence tracker)
+var g_msg_ids: Map = Map.new()         // queue_name -> Array of message IDs (ordered)
+var g_msg_payload: Map = Map.new()     // "queue::msg_id" -> payload String
+var g_msg_status: Map = Map.new()      // "queue::msg_id" -> int (0=pending, 1=delivered, 2=acked)
+var g_msg_deliver_time: Map = Map.new() // "queue::msg_id" -> int (delivery timestamp us)
+var g_msg_deliver_fd: Map = Map.new()  // "queue::msg_id" -> int (consumer fd)
+
+// Waiting consumers: queue_name -> Array of fds waiting for DEQUEUE (blocking)
+var g_waiters: Map = Map.new()
+
+// Config
+var g_ack_timeout: int = 30           // seconds before redelivery (default 30s)
+var g_msg_counter: int = 0            // monotonic message ID counter
+var g_changes_since_save: int = 0
+var g_last_save_time: int = 0
+var g_save_path: String = "queue.ndb"
+
+// Stats
+var g_ops_total: int = 0
+var g_connections: int = 0
+var g_total_enqueued: int = 0
+var g_total_acked: int = 0
+var g_total_redelivered: int = 0
+
+// Mutex for queue operations (thread safety)
+var g_mtx: Map = Map.new()
+var g_mtx_init: int = 0
+
+fn ensure_mtx() {
+    if g_mtx_init == 0 {
+        g_mtx = mutex_new()
+        g_mtx_init = 1
+    }
+    return 0
+}
+
+// Generate unique message ID: monotonic counter as hex string
+fn gen_msg_id() -> String {
+    g_msg_counter = g_msg_counter + 1
+    let ts: int = time_us()
+    // Format: timestamp_counter (unique + sortable)
+    return int_to_string(ts) + "_" + int_to_string(g_msg_counter)
+}
+
+// Create a queue if it doesn't exist
+fn mq_ensure_queue(name: String) {
+    if g_queues.contains(name) == false {
+        g_queues.insert(name, 1)
+        let ids: Array = []
+        g_msg_ids.insert(name, ids)
+    }
+    return 0
+}
+
+// ENQUEUE queue_name payload -> message_id
+pub fn mq_enqueue(queue_name: String, payload: String) -> String {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    mq_ensure_queue(queue_name)
+
+    let msg_id: String = gen_msg_id()
+    let flat_key: String = queue_name + "::" + msg_id
+
+    // Add to queue
+    let ids: Array = g_msg_ids.get(queue_name)
+    ids.push(msg_id)
+
+    // Store message data
+    g_msg_payload.insert(flat_key, payload)
+    g_msg_status.insert(flat_key, 0)  // pending
+
+    g_ops_total = g_ops_total + 1
+    g_changes_since_save = g_changes_since_save + 1
+    g_total_enqueued = g_total_enqueued + 1
+
+    // Check if there are waiting consumers
+    if g_waiters.contains(queue_name) {
+        let waiters: Array = g_waiters.get(queue_name)
+        if waiters.length() > 0 {
+            // Wake up first waiter by delivering this message
+            let consumer_fd: int = waiters[0]
+            // Remove waiter from list
+            let rest: Array = waiters.slice(1, waiters.length())
+            g_waiters.insert(queue_name, rest)
+
+            // Mark as delivered
+            g_msg_status.insert(flat_key, 1)
+            g_msg_deliver_time.insert(flat_key, time_us())
+            g_msg_deliver_fd.insert(flat_key, consumer_fd)
+
+            mutex_unlock(g_mtx)
+
+            // Send message to waiting consumer
+            let resp: String = mq_format_message(msg_id, payload)
+            tcp_write(consumer_fd, resp)
+            return msg_id
+        }
+    }
+
+    mutex_unlock(g_mtx)
+    return msg_id
+}
+
+// DEQUEUE queue_name NOWAIT -> [msg_id, payload] or nil
+// Returns "" if no messages available (NOWAIT mode)
+pub fn mq_dequeue_nowait(queue_name: String, consumer_fd: int) -> Array {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    g_ops_total = g_ops_total + 1
+
+    if g_queues.contains(queue_name) == false {
+        mutex_unlock(g_mtx)
+        return []
+    }
+
+    let ids: Array = g_msg_ids.get(queue_name)
+
+    // Find first pending message
+    var i: int = 0
+    while i < ids.length() {
+        let msg_id: String = ids[i]
+        let flat_key: String = queue_name + "::" + msg_id
+        if g_msg_status.contains(flat_key) {
+            let status: int = g_msg_status.get(flat_key)
+            if status == 0 {
+                // Deliver this message
+                g_msg_status.insert(flat_key, 1)
+                g_msg_deliver_time.insert(flat_key, time_us())
+                g_msg_deliver_fd.insert(flat_key, consumer_fd)
+                let payload: String = g_msg_payload.get(flat_key)
+                mutex_unlock(g_mtx)
+                return [msg_id, payload]
+            }
+        }
+        i = i + 1
+    }
+
+    mutex_unlock(g_mtx)
+    return []
+}
+
+// Register a blocking consumer waiter
+pub fn mq_register_waiter(queue_name: String, consumer_fd: int) {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    mq_ensure_queue(queue_name)
+
+    // First try to deliver a pending message immediately
+    let ids: Array = g_msg_ids.get(queue_name)
+    var i: int = 0
+    while i < ids.length() {
+        let msg_id: String = ids[i]
+        let flat_key: String = queue_name + "::" + msg_id
+        if g_msg_status.contains(flat_key) {
+            let status: int = g_msg_status.get(flat_key)
+            if status == 0 {
+                // Deliver immediately
+                g_msg_status.insert(flat_key, 1)
+                g_msg_deliver_time.insert(flat_key, time_us())
+                g_msg_deliver_fd.insert(flat_key, consumer_fd)
+                let payload: String = g_msg_payload.get(flat_key)
+                mutex_unlock(g_mtx)
+                let resp: String = mq_format_message(msg_id, payload)
+                tcp_write(consumer_fd, resp)
+                return 0
+            }
+        }
+        i = i + 1
+    }
+
+    // No messages available, add to waiters
+    if g_waiters.contains(queue_name) == false {
+        let w: Array = []
+        g_waiters.insert(queue_name, w)
+    }
+    let waiters: Array = g_waiters.get(queue_name)
+    waiters.push(consumer_fd)
+
+    mutex_unlock(g_mtx)
+    return 0
+}
+
+// ACK message_id -> 1 if acked, 0 if not found
+pub fn mq_ack(queue_name: String, msg_id: String) -> int {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    g_ops_total = g_ops_total + 1
+
+    let flat_key: String = queue_name + "::" + msg_id
+    if g_msg_status.contains(flat_key) == false {
+        mutex_unlock(g_mtx)
+        return 0
+    }
+
+    let status: int = g_msg_status.get(flat_key)
+    if status != 1 {
+        // Can only ACK delivered messages
+        mutex_unlock(g_mtx)
+        return 0
+    }
+
+    // Mark as acked
+    g_msg_status.insert(flat_key, 2)
+    g_total_acked = g_total_acked + 1
+    g_changes_since_save = g_changes_since_save + 1
+
+    // Remove from queue's message list
+    if g_queues.contains(queue_name) {
+        let ids: Array = g_msg_ids.get(queue_name)
+        let new_ids: Array = []
+        var i: int = 0
+        while i < ids.length() {
+            let id: String = ids[i]
+            if id != msg_id {
+                new_ids.push(id)
+            }
+            i = i + 1
+        }
+        g_msg_ids.insert(queue_name, new_ids)
+    }
+
+    // Cleanup message data
+    g_msg_payload.remove(flat_key)
+    g_msg_status.remove(flat_key)
+    if g_msg_deliver_time.contains(flat_key) { g_msg_deliver_time.remove(flat_key) }
+    if g_msg_deliver_fd.contains(flat_key) { g_msg_deliver_fd.remove(flat_key) }
+
+    mutex_unlock(g_mtx)
+    return 1
+}
+
+// NACK message_id -> 1 if nacked (requeued), 0 if not found
+pub fn mq_nack(queue_name: String, msg_id: String) -> int {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    g_ops_total = g_ops_total + 1
+
+    let flat_key: String = queue_name + "::" + msg_id
+    if g_msg_status.contains(flat_key) == false {
+        mutex_unlock(g_mtx)
+        return 0
+    }
+
+    // Reset to pending
+    g_msg_status.insert(flat_key, 0)
+    if g_msg_deliver_time.contains(flat_key) { g_msg_deliver_time.remove(flat_key) }
+    if g_msg_deliver_fd.contains(flat_key) { g_msg_deliver_fd.remove(flat_key) }
+    g_changes_since_save = g_changes_since_save + 1
+
+    mutex_unlock(g_mtx)
+    return 1
+}
+
+// QLEN queue_name -> number of messages (pending + delivered, not acked)
+pub fn mq_qlen(queue_name: String) -> int {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    g_ops_total = g_ops_total + 1
+
+    if g_queues.contains(queue_name) == false {
+        mutex_unlock(g_mtx)
+        return 0
+    }
+
+    let ids: Array = g_msg_ids.get(queue_name)
+    let result: int = ids.length()
+    mutex_unlock(g_mtx)
+    return result
+}
+
+// QINFO queue_name -> [pending_count, delivered_count, total_enqueued, total_acked]
+pub fn mq_qinfo(queue_name: String) -> Array {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    g_ops_total = g_ops_total + 1
+
+    if g_queues.contains(queue_name) == false {
+        mutex_unlock(g_mtx)
+        return [0, 0, 0, 0]
+    }
+
+    let ids: Array = g_msg_ids.get(queue_name)
+    var pending: int = 0
+    var delivered: int = 0
+    var i: int = 0
+    while i < ids.length() {
+        let msg_id: String = ids[i]
+        let flat_key: String = queue_name + "::" + msg_id
+        if g_msg_status.contains(flat_key) {
+            let status: int = g_msg_status.get(flat_key)
+            if status == 0 { pending = pending + 1 }
+            if status == 1 { delivered = delivered + 1 }
+        }
+        i = i + 1
+    }
+
+    mutex_unlock(g_mtx)
+    return [pending, delivered, g_total_enqueued, g_total_acked]
+}
+
+// QUEUES -> list of queue names
+pub fn mq_queues() -> Array {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+    let result: Array = g_queues.keys()
+    mutex_unlock(g_mtx)
+    return result
+}
+
+// QDEL queue_name -> 1 if deleted, 0 if not found
+pub fn mq_qdel(queue_name: String) -> int {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    g_ops_total = g_ops_total + 1
+
+    if g_queues.contains(queue_name) == false {
+        mutex_unlock(g_mtx)
+        return 0
+    }
+
+    // Cleanup all messages
+    let ids: Array = g_msg_ids.get(queue_name)
+    var i: int = 0
+    while i < ids.length() {
+        let msg_id: String = ids[i]
+        let flat_key: String = queue_name + "::" + msg_id
+        if g_msg_payload.contains(flat_key) { g_msg_payload.remove(flat_key) }
+        if g_msg_status.contains(flat_key) { g_msg_status.remove(flat_key) }
+        if g_msg_deliver_time.contains(flat_key) { g_msg_deliver_time.remove(flat_key) }
+        if g_msg_deliver_fd.contains(flat_key) { g_msg_deliver_fd.remove(flat_key) }
+        i = i + 1
+    }
+
+    g_queues.remove(queue_name)
+    g_msg_ids.remove(queue_name)
+    if g_waiters.contains(queue_name) { g_waiters.remove(queue_name) }
+    g_changes_since_save = g_changes_since_save + 1
+
+    mutex_unlock(g_mtx)
+    return 1
+}
+
+// Redelivery: check all delivered messages, redeliver if ack_timeout exceeded
+pub fn mq_check_redelivery() -> int {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    let now: int = time_us()
+    let timeout_us: int = g_ack_timeout * 1000000
+    var redelivered: int = 0
+
+    let queue_names: Array = g_queues.keys()
+    var qi: int = 0
+    while qi < queue_names.length() {
+        let qname: String = queue_names[qi]
+        let ids: Array = g_msg_ids.get(qname)
+        var i: int = 0
+        while i < ids.length() {
+            let msg_id: String = ids[i]
+            let flat_key: String = qname + "::" + msg_id
+            if g_msg_status.contains(flat_key) {
+                let status: int = g_msg_status.get(flat_key)
+                if status == 1 {
+                    // Check timeout
+                    if g_msg_deliver_time.contains(flat_key) {
+                        let deliver_time: int = g_msg_deliver_time.get(flat_key)
+                        if now - deliver_time > timeout_us {
+                            // Reset to pending for redelivery
+                            g_msg_status.insert(flat_key, 0)
+                            g_msg_deliver_time.remove(flat_key)
+                            if g_msg_deliver_fd.contains(flat_key) {
+                                g_msg_deliver_fd.remove(flat_key)
+                            }
+                            redelivered = redelivered + 1
+                            g_total_redelivered = g_total_redelivered + 1
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+        qi = qi + 1
+    }
+
+    mutex_unlock(g_mtx)
+    return redelivered
+}
+
+// Remove a consumer from all waiter lists (on disconnect)
+pub fn mq_remove_waiter(fd: int) {
+    ensure_mtx()
+    mutex_lock(g_mtx)
+
+    let queue_names: Array = g_queues.keys()
+    var qi: int = 0
+    while qi < queue_names.length() {
+        let qname: String = queue_names[qi]
+        if g_waiters.contains(qname) {
+            let waiters: Array = g_waiters.get(qname)
+            let new_waiters: Array = []
+            var i: int = 0
+            while i < waiters.length() {
+                let w: int = waiters[i]
+                if w != fd {
+                    new_waiters.push(w)
+                }
+                i = i + 1
+            }
+            g_waiters.insert(qname, new_waiters)
+        }
+        qi = qi + 1
+    }
+
+    mutex_unlock(g_mtx)
+    return 0
+}
+
+// Format a message delivery as RESP array: *3 msg_id queue_name payload
+fn mq_format_message(msg_id: String, payload: String) -> String {
+    var sb: StringBuilder = StringBuilder.new()
+    sb.append("*2\r\n$")
+    sb.append(int_to_string(msg_id.length()))
+    sb.append("\r\n")
+    sb.append(msg_id)
+    sb.append("\r\n$")
+    sb.append(int_to_string(payload.length()))
+    sb.append("\r\n")
+    sb.append(payload)
+    sb.append("\r\n")
+    return sb.to_string()
+}

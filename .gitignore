@@ -1,0 +1,7 @@
+nyx-queue
+script.nx
+script.ll
+packages/
+*.o
+*.ndb
+.DS_Store
