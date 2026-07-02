@@ -1,0 +1,158 @@
+// main.nx — nyx-queue entry point
+// Persistent message queue with RESP protocol
+//
+// Usage: ./nyx-queue                          (default port 6381)
+//        ./nyx-queue --port 6382              (custom port)
+//        ./nyx-queue --ack-timeout 60         (60s ack timeout, default 30s)
+//
+// Connect: redis-cli -p 6381
+//
+// Commands:
+//   ENQUEUE <queue> <payload>     → message ID
+//   DEQUEUE <queue>               → blocks until message available
+//   DEQUEUE <queue> NOWAIT        → returns message or nil
+//   ACK <queue> <msg_id>          → acknowledges processing
+//   NACK <queue> <msg_id>         → requeues for redelivery
+//   QLEN <queue>                  → number of messages
+//   QINFO <queue>                 → queue statistics
+//   QUEUES                        → list all queues
+//   QDEL <queue>                  → delete a queue
+//   PING                          → PONG
+//   INFO                          → server stats
+//   QUIT                          → close connection
+
+import "std/resp"
+import "src/limits"
+import "src/store"
+import "src/commands"
+import "src/persist"
+
+// Shutdown handler
+fn on_shutdown() -> int {
+    if g_changes_since_save > 0 {
+        let saved: int = mq_save(g_save_path)
+        print("[shutdown] saved " + int_to_string(saved) + " queues to " + g_save_path)
+    } else {
+        print("[shutdown] no pending changes, skipping save")
+    }
+    return 0
+}
+
+// Global channel for dispatching client fds to workers
+var g_ch: Map = Map.new()
+
+// Worker: receive client fd from channel, serve commands
+fn queue_worker() -> int {
+    while 1 > 0 {
+        let client: int = channel_recv(g_ch)
+        if client < 0 { return 0 }
+
+        g_connections = g_connections + 1
+
+        var connected: bool = true
+        while connected {
+            let cmd: Array = resp_read_command(client)
+            if cmd.length() == 0 {
+                connected = false
+            } else {
+                // Rate limit check
+                let q_ip: String = getpeername(client)
+                let q_rl: String = queue_check_rate(q_ip)
+                if q_rl.length() > 0 {
+                    tcp_write(client, q_rl)
+                    connected = false
+                } else {
+                    let response: String = dispatch_command(cmd, client)
+                    if response == "__QUIT__" {
+                        tcp_write(client, resp_simple_string("OK"))
+                        connected = false
+                    } else if response == "__BLOCKING__" {
+                        // Consumer waiting — store sends message directly
+                    } else if response.length() > 0 {
+                        tcp_write(client, response)
+                    }
+                }
+            }
+        }
+
+        mq_remove_waiter(client)
+        tcp_close(client)
+    }
+    return 0
+}
+
+fn main() {
+    var port: int = 6381
+    let num_workers: int = 64
+
+    // Parse CLI args
+    let args: Array = get_args()
+    var ai: int = 1
+    while ai < args.length() {
+        let arg: String = args[ai]
+        if arg == "--port" and ai + 1 < args.length() {
+            let port_arg: String = args[ai + 1]
+            port = string_to_int(port_arg)
+            ai = ai + 2
+        } else if arg == "--ack-timeout" and ai + 1 < args.length() {
+            let timeout_arg: String = args[ai + 1]
+            g_ack_timeout = string_to_int(timeout_arg)
+            ai = ai + 2
+        } else if arg == "--rate-limit" and ai + 1 < args.length() {
+            let rl_arg: String = args[ai + 1]
+            QUEUE_RATE_LIMIT = string_to_int(rl_arg)
+            ai = ai + 2
+        } else if arg == "--no-rate-limit" {
+            g_rate_enabled = 0
+            ai = ai + 1
+        } else {
+            ai = ai + 1
+        }
+    }
+
+    init_queue_limits()
+    setup_shutdown_handler(on_shutdown)
+
+    // Restore from snapshot
+    if file_exists(g_save_path) {
+        let loaded: int = mq_load(g_save_path)
+        print("[restore] loaded " + int_to_string(loaded) + " queues from " + g_save_path)
+    }
+
+    print("nyx-queue v0.1.0 — persistent message queue")
+    print("Listening on port " + int_to_string(port))
+    print("ACK timeout: " + int_to_string(g_ack_timeout) + "s")
+
+    g_ch = channel_new(256)
+    let server: int = tcp_listen("0.0.0.0", port)
+    if server < 0 {
+        print("ERROR: cannot listen on port " + int_to_string(port))
+        return 0
+    }
+
+    // Spawn worker threads
+    var i: int = 0
+    while i < num_workers {
+        thread_spawn(queue_worker)
+        i = i + 1
+    }
+
+    // Spawn background saver
+    thread_spawn(mq_bg_saver)
+    print("[persist] background saver enabled (save to " + g_save_path + ")")
+
+    // Spawn redelivery checker
+    thread_spawn(mq_redelivery_checker)
+    print("[redelivery] checker enabled (timeout: " + int_to_string(g_ack_timeout) + "s)")
+
+    print(int_to_string(num_workers) + " workers spawned, ready for connections...")
+
+    // Accept loop
+    while 1 > 0 {
+        let client: int = tcp_accept(server)
+        if client >= 0 {
+            channel_send(g_ch, client)
+        }
+    }
+    return 0
+}
