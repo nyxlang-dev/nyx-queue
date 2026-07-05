@@ -1,0 +1,192 @@
+// commands.nx — Command dispatch for nyx-queue
+//
+// Commands:
+//   ENQUEUE <queue> <payload>           → msg_id (bulk string)
+//   DEQUEUE <queue>                     → blocks until message available, returns [msg_id, payload]
+//   DEQUEUE <queue> NOWAIT              → returns [msg_id, payload] or nil
+//   ACK <queue> <msg_id>                → OK or error
+//   NACK <queue> <msg_id>              → OK (requeue for redelivery)
+//   QLEN <queue>                        → integer (messages in queue)
+//   QINFO <queue>                       → [pending, delivered, total_enqueued, total_acked]
+//   QUEUES                              → list of queue names
+//   QDEL <queue>                        → OK or error
+//   PING [msg]                          → PONG or msg
+//   INFO                                → server stats
+//   QUIT                                → OK (close connection)
+
+import "src/store"
+import "std/resp"
+
+pub fn dispatch_command(cmd: Array, fd: int) -> String {
+    if cmd.length() == 0 { return resp_error("empty command") }
+
+    let raw: String = cmd[0]
+    let command: String = raw.toUpper()
+
+    // PING
+    if command == "PING" {
+        if cmd.length() >= 2 {
+            let msg: String = cmd[1]
+            return resp_bulk_string(msg)
+        }
+        return resp_simple_string("PONG")
+    }
+
+    // QUIT
+    if command == "QUIT" {
+        return "__QUIT__"
+    }
+
+    // ENQUEUE queue payload
+    if command == "ENQUEUE" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'ENQUEUE' command")
+        }
+        let queue_name: String = cmd[1]
+        let payload: String = cmd[2]
+        let msg_id: String = mq_enqueue(queue_name, payload)
+        return resp_bulk_string(msg_id)
+    }
+
+    // DEQUEUE queue [NOWAIT]
+    if command == "DEQUEUE" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'DEQUEUE' command")
+        }
+        let queue_name: String = cmd[1]
+
+        // Check for NOWAIT flag
+        if cmd.length() >= 3 {
+            let flag: String = cmd[2]
+            let flag_upper: String = flag.toUpper()
+            if flag_upper == "NOWAIT" {
+                let result: Array = mq_dequeue_nowait(queue_name, fd)
+                if result.length() == 0 {
+                    return resp_null_bulk()
+                }
+                return resp_bulk_array(result)
+            }
+        }
+
+        // Blocking DEQUEUE: try immediately, if no message, register as waiter
+        let result: Array = mq_dequeue_nowait(queue_name, fd)
+        if result.length() > 0 {
+            return resp_bulk_array(result)
+        }
+
+        // Register waiter — message will be sent when available
+        mq_register_waiter(queue_name, fd)
+        return "__BLOCKING__"
+    }
+
+    // ACK queue msg_id
+    if command == "ACK" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'ACK' command")
+        }
+        let queue_name: String = cmd[1]
+        let msg_id: String = cmd[2]
+        let result: int = mq_ack(queue_name, msg_id)
+        if result == 1 {
+            return resp_simple_string("OK")
+        }
+        return resp_error("message not found or not delivered")
+    }
+
+    // NACK queue msg_id
+    if command == "NACK" {
+        if cmd.length() < 3 {
+            return resp_error("wrong number of arguments for 'NACK' command")
+        }
+        let queue_name: String = cmd[1]
+        let msg_id: String = cmd[2]
+        let result: int = mq_nack(queue_name, msg_id)
+        if result == 1 {
+            return resp_simple_string("OK")
+        }
+        return resp_error("message not found")
+    }
+
+    // QLEN queue
+    if command == "QLEN" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'QLEN' command")
+        }
+        let queue_name: String = cmd[1]
+        let len: int = mq_qlen(queue_name)
+        return resp_integer(len)
+    }
+
+    // QINFO queue
+    if command == "QINFO" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'QINFO' command")
+        }
+        let queue_name: String = cmd[1]
+        let info: Array = mq_qinfo(queue_name)
+        let pending: int = info[0]
+        let delivered: int = info[1]
+        let total_enq: int = info[2]
+        let total_ack: int = info[3]
+        let result: Array = [
+            int_to_string(pending),
+            int_to_string(delivered),
+            int_to_string(total_enq),
+            int_to_string(total_ack)
+        ]
+        return resp_bulk_array(result)
+    }
+
+    // QUEUES
+    if command == "QUEUES" {
+        let names: Array = mq_queues()
+        return resp_bulk_array(names)
+    }
+
+    // QDEL queue
+    if command == "QDEL" {
+        if cmd.length() < 2 {
+            return resp_error("wrong number of arguments for 'QDEL' command")
+        }
+        let queue_name: String = cmd[1]
+        let result: int = mq_qdel(queue_name)
+        if result == 1 {
+            return resp_simple_string("OK")
+        }
+        return resp_error("queue not found")
+    }
+
+    // INFO
+    if command == "INFO" {
+        var sb: StringBuilder = StringBuilder.new()
+        sb.append("# nyx-queue\r\n")
+        sb.append("version:0.1.0\r\n")
+        sb.append("ops_total:")
+        sb.append(int_to_string(g_ops_total))
+        sb.append("\r\n")
+        sb.append("connections:")
+        sb.append(int_to_string(g_connections))
+        sb.append("\r\n")
+        sb.append("total_enqueued:")
+        sb.append(int_to_string(g_total_enqueued))
+        sb.append("\r\n")
+        sb.append("total_acked:")
+        sb.append(int_to_string(g_total_acked))
+        sb.append("\r\n")
+        sb.append("total_redelivered:")
+        sb.append(int_to_string(g_total_redelivered))
+        sb.append("\r\n")
+        sb.append("ack_timeout:")
+        sb.append(int_to_string(g_ack_timeout))
+        sb.append("\r\n")
+        let info: String = sb.to_string()
+        return resp_bulk_string(info)
+    }
+
+    // COMMAND (redis-cli compatibility)
+    if command == "COMMAND" {
+        return "*0\r\n"
+    }
+
+    return resp_error("unknown command '" + raw + "'")
+}

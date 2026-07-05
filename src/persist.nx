@@ -1,0 +1,299 @@
+// persist.nx — Binary .ndb persistence for nyx-queue
+//
+// Format:
+//   [HEADER]   5 bytes "NYXMQ" + 1 byte version (0x01)
+//   [META]     8 bytes timestamp LE + 4 bytes num_queues LE + 4 bytes msg_counter LE
+//   [QUEUES]   Per queue:
+//                4 bytes queue_name length + N bytes name
+//                4 bytes message count
+//                Per message:
+//                  4 bytes msg_id length + N bytes msg_id
+//                  4 bytes payload length + N bytes payload
+//                  1 byte status (0=pending, 1=delivered→reset to pending on load)
+//   [CHECKSUM] 4 bytes CRC32 of everything before
+//   [EOF]      1 byte 0xFF
+
+import "src/store"
+
+// ── Binary encoding helpers ──
+
+fn push_byte(arr: Array, val: int) {
+    arr.push(val & 255)
+}
+
+fn push_i32_le(arr: Array, val: int) {
+    arr.push(val & 255)
+    arr.push((val >> 8) & 255)
+    arr.push((val >> 16) & 255)
+    arr.push((val >> 24) & 255)
+}
+
+fn push_i64_le(arr: Array, val: int) {
+    arr.push(val & 255)
+    arr.push((val >> 8) & 255)
+    arr.push((val >> 16) & 255)
+    arr.push((val >> 24) & 255)
+    arr.push((val >> 32) & 255)
+    arr.push((val >> 40) & 255)
+    arr.push((val >> 48) & 255)
+    arr.push((val >> 56) & 255)
+}
+
+fn push_string(arr: Array, s: String) {
+    let slen: int = str_byte_length(s)
+    push_i32_le(arr, slen)
+    var i: int = 0
+    while i < slen {
+        arr.push(s.charAt(i))
+        i = i + 1
+    }
+}
+
+// ── Binary decoding helpers ──
+
+fn read_byte(arr: Array, offset: int) -> int {
+    let b: int = arr[offset]
+    return b & 255
+}
+
+fn read_i32_le(arr: Array, offset: int) -> int {
+    let b0: int = arr[offset] & 255
+    let b1: int = arr[offset + 1] & 255
+    let b2: int = arr[offset + 2] & 255
+    let b3: int = arr[offset + 3] & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24)
+}
+
+fn read_i64_le(arr: Array, offset: int) -> int {
+    let b0: int = arr[offset] & 255
+    let b1: int = arr[offset + 1] & 255
+    let b2: int = arr[offset + 2] & 255
+    let b3: int = arr[offset + 3] & 255
+    let b4: int = arr[offset + 4] & 255
+    let b5: int = arr[offset + 5] & 255
+    let b6: int = arr[offset + 6] & 255
+    let b7: int = arr[offset + 7] & 255
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24) | (b4 << 32) | (b5 << 40) | (b6 << 48) | (b7 << 56)
+}
+
+fn read_string(arr: Array, offset: int) -> Array {
+    let slen: int = read_i32_le(arr, offset)
+    let s: String = string_from_bytes(arr, offset + 4, slen)
+    let new_offset: int = offset + 4 + slen
+    return [s, new_offset]
+}
+
+// ── Serialize ──
+
+pub fn mq_save(path: String) -> int {
+    let buf: Array = []
+    var saved_queues: int = 0
+    let now_sec: int = time_us() / 1000000
+
+    // HEADER: "NYXMQ" + version 0x01
+    push_byte(buf, 78)   // N
+    push_byte(buf, 89)   // Y
+    push_byte(buf, 88)   // X
+    push_byte(buf, 77)   // M
+    push_byte(buf, 81)   // Q
+    push_byte(buf, 1)    // version
+
+    // META: 8-byte timestamp + 4-byte num_queues + 4-byte msg_counter
+    push_i64_le(buf, now_sec)
+    let queue_names: Array = g_queues.keys()
+    push_i32_le(buf, queue_names.length())
+    push_i32_le(buf, g_msg_counter)
+
+    // Serialize each queue
+    var qi: int = 0
+    while qi < queue_names.length() {
+        let qname: String = queue_names[qi]
+        push_string(buf, qname)
+
+        let ids: Array = g_msg_ids.get(qname)
+
+        // Count non-acked messages
+        var msg_count: int = 0
+        var ci: int = 0
+        while ci < ids.length() {
+            let mid: String = ids[ci]
+            let fk: String = qname + "::" + mid
+            if g_msg_status.contains(fk) {
+                let st: int = g_msg_status.get(fk)
+                if st != 2 {
+                    msg_count = msg_count + 1
+                }
+            }
+            ci = ci + 1
+        }
+        push_i32_le(buf, msg_count)
+
+        // Write each non-acked message
+        var mi: int = 0
+        while mi < ids.length() {
+            let msg_id: String = ids[mi]
+            let flat_key: String = qname + "::" + msg_id
+            if g_msg_status.contains(flat_key) {
+                let status: int = g_msg_status.get(flat_key)
+                if status != 2 {
+                    let payload: String = g_msg_payload.get(flat_key)
+                    push_string(buf, msg_id)
+                    push_string(buf, payload)
+                    // Save as pending (0) — delivered messages reset on restart
+                    push_byte(buf, 0)
+                }
+            }
+            mi = mi + 1
+        }
+
+        saved_queues = saved_queues + 1
+        qi = qi + 1
+    }
+
+    // CHECKSUM: CRC32
+    let crc: int = crc32_bytes(buf)
+    push_i32_le(buf, crc)
+
+    // EOF marker
+    push_byte(buf, 255)
+
+    // Atomic write
+    let tmp_path: String = path + ".tmp"
+    let f: Map = file_open(tmp_path, "wb")
+    file_write_bytes(f, buf)
+    file_flush(f)
+    file_close(f)
+    rename_file(tmp_path, path)
+
+    g_changes_since_save = 0
+    g_last_save_time = time_us()
+    return saved_queues
+}
+
+// ── Deserialize ──
+
+pub fn mq_load(path: String) -> int {
+    let f: Map = file_open(path, "rb")
+    file_seek(f, 0, 2)
+    let file_size: int = file_tell(f)
+    file_seek(f, 0, 0)
+    let buf: Array = file_read_bytes(f, file_size)
+    file_close(f)
+
+    if buf.length() < 22 {
+        print("[persist] ERROR: queue.ndb too small (" + int_to_string(buf.length()) + " bytes)")
+        return 0
+    }
+
+    // Validate HEADER: "NYXMQ"
+    if buf[0] != 78 or buf[1] != 89 or buf[2] != 88 or buf[3] != 77 or buf[4] != 81 {
+        print("[persist] ERROR: invalid magic (not NYXMQ)")
+        return 0
+    }
+    let version: int = buf[5]
+    if version != 1 {
+        print("[persist] ERROR: unsupported version " + int_to_string(version))
+        return 0
+    }
+
+    // Verify checksum
+    let data_len: int = buf.length() - 5
+    let stored_crc: int = read_i32_le(buf, data_len)
+    let data_buf: Array = buf.slice(0, data_len)
+    let computed_crc: int = crc32_bytes(data_buf)
+    if stored_crc != computed_crc {
+        print("[persist] ERROR: CRC32 mismatch (file corrupted)")
+        return 0
+    }
+
+    // Verify EOF
+    let eof_byte: int = buf[buf.length() - 1]
+    if eof_byte != 255 {
+        print("[persist] ERROR: missing EOF marker")
+        return 0
+    }
+
+    // META
+    let timestamp: int = read_i64_le(buf, 6)
+    let num_queues: int = read_i32_le(buf, 14)
+    let saved_counter: int = read_i32_le(buf, 18)
+    g_msg_counter = saved_counter
+
+    var offset: int = 22
+    var loaded: int = 0
+
+    var qi: int = 0
+    while qi < num_queues and offset < data_len {
+        // Read queue name
+        let qname_result: Array = read_string(buf, offset)
+        let qname: String = qname_result[0]
+        offset = qname_result[1]
+
+        // Read message count
+        let msg_count: int = read_i32_le(buf, offset)
+        offset = offset + 4
+
+        // Initialize queue
+        mq_ensure_queue(qname)
+
+        // Read messages
+        var mi: int = 0
+        while mi < msg_count and offset < data_len {
+            let mid_result: Array = read_string(buf, offset)
+            let msg_id: String = mid_result[0]
+            offset = mid_result[1]
+
+            let payload_result: Array = read_string(buf, offset)
+            let payload: String = payload_result[0]
+            offset = payload_result[1]
+
+            let status: int = read_byte(buf, offset)
+            offset = offset + 1
+
+            // Restore message
+            let flat_key: String = qname + "::" + msg_id
+            let ids: Array = g_msg_ids.get(qname)
+            ids.push(msg_id)
+            g_msg_payload.insert(flat_key, payload)
+            g_msg_status.insert(flat_key, 0)  // Always restore as pending
+
+            mi = mi + 1
+        }
+
+        loaded = loaded + 1
+        qi = qi + 1
+    }
+
+    g_last_save_time = time_us()
+    g_changes_since_save = 0
+    return loaded
+}
+
+// Background saver thread
+pub fn mq_bg_saver() -> int {
+    while 1 > 0 {
+        sleep(10000)
+        if g_changes_since_save > 0 {
+            let now: int = time_us()
+            let elapsed: int = now - g_last_save_time
+            let elapsed_sec: int = elapsed / 1000000
+            if g_changes_since_save >= 100 or elapsed_sec >= 60 {
+                let saved: int = mq_save(g_save_path)
+                print("[bg-save] saved " + int_to_string(saved) + " queues to " + g_save_path)
+            }
+        }
+    }
+    return 0
+}
+
+// Redelivery checker thread
+pub fn mq_redelivery_checker() -> int {
+    while 1 > 0 {
+        sleep(5000)  // Check every 5 seconds
+        let redelivered: int = mq_check_redelivery()
+        if redelivered > 0 {
+            print("[redelivery] " + int_to_string(redelivered) + " messages requeued")
+        }
+    }
+    return 0
+}
