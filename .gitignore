@@ -2,6 +2,9 @@ nyx-queue
 queue.ndb
 script.nx
 script.ll
+nyx.lock
 packages/
+__pycache__/
 *.o
 .DS_Store
+CLAUDE.local.md
