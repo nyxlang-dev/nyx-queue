@@ -119,7 +119,7 @@ fn main() {
         print("[restore] loaded " + int_to_string(loaded) + " queues from " + g_save_path)
     }
 
-    print("nyx-queue v0.1.0 — persistent message queue")
+    print("nyx-queue v0.2.1 — persistent message queue")
     print("Listening on port " + int_to_string(port))
     print("ACK timeout: " + int_to_string(g_ack_timeout) + "s")
 

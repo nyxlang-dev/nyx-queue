@@ -160,7 +160,10 @@ pub fn dispatch_command(cmd: Array, fd: int) -> String {
     if command == "INFO" {
         var sb: StringBuilder = StringBuilder.new()
         sb.append("# nyx-queue\r\n")
-        sb.append("version:0.1.0\r\n")
+        // OJO: literal, hay que moverlo a mano junto con nyx.toml. Quedó en
+        // 0.1.0 mientras el paquete iba por 0.2.0 — INFO le mentía la versión
+        // a cualquiera que la consultara para decidir compatibilidad.
+        sb.append("version:0.2.1\r\n")
         sb.append("ops_total:")
         sb.append(int_to_string(g_ops_total))
         sb.append("\r\n")
