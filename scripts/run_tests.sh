@@ -32,3 +32,14 @@ while ! (echo > /dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; do
 done
 
 python3 tests/test_nyx_queue.py 127.0.0.1 "$PORT"
+rc_resp=$?
+
+# Round-trip de persistencia: levanta y apaga sus PROPIOS daemons en un
+# directorio temporal (necesita el ciclo SIGTERM -> mq_save -> reinicio ->
+# mq_load, que no se puede hacer contra el servidor de arriba sin matarlo).
+echo ""
+echo "== round-trip de persistencia (.ndb) =="
+python3 "$STACK/tests/test_queue_persist.py" "$BIN"
+rc_persist=$?
+
+[ "$rc_resp" -eq 0 ] && [ "$rc_persist" -eq 0 ]

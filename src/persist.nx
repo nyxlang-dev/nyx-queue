@@ -3,6 +3,11 @@
 // Format:
 //   [HEADER]   5 bytes "NYXMQ" + 1 byte version (0x01)
 //   [META]     8 bytes timestamp LE + 4 bytes num_queues LE + 4 bytes msg_counter LE
+//              El timestamp es epoch en SEGUNDOS (time_epoch()). Hasta el
+//              2026-09-10 se escribia time_us()/1000000 —uptime de la maquina—,
+//              un dato falso bajo un nombre honesto. El offset y el ancho no
+//              cambian, asi que los .ndb viejos se siguen leyendo igual; lo que
+//              cambia es que el numero ahora significa lo que dice.
 //   [QUEUES]   Per queue:
 //                4 bytes queue_name length + N bytes name
 //                4 bytes message count
@@ -88,7 +93,15 @@ fn read_string(arr: Array, offset: int) -> Array {
 pub fn mq_save(path: String) -> int {
     let buf: Array = []
     var saved_queues: int = 0
-    let now_sec: int = time_us() / 1000000
+    // time_epoch(), no time_us()/1000000. Este valor se ESCRIBE AL DISCO en el
+    // META del .ndb, en un archivo pensado para sobrevivir reinicios y hasta
+    // cambios de maquina. time_us() es os_monotonic_ns()/1000: segundos desde
+    // el ARRANQUE de la maquina, no desde epoch, asi que lo que se guardaba era
+    // un uptime disfrazado de fecha. Nadie lo leia de vuelta —mq_load lo
+    // decodificaba y descartaba—, o sea que era un dato falso esperando su
+    // primer lector. Corregido el 2026-09-10, y de paso el campo dejo de estar
+    // muerto: ahora alimenta last_save_epoch en INFO.
+    let now_sec: int = time_epoch()
 
     // HEADER: "NYXMQ" + version 0x01
     push_byte(buf, 78)   // N
@@ -100,6 +113,7 @@ pub fn mq_save(path: String) -> int {
 
     // META: 8-byte timestamp + 4-byte num_queues + 4-byte msg_counter
     push_i64_le(buf, now_sec)
+    g_snapshot_epoch = now_sec
     let queue_names: Array = g_queues.keys()
     push_i32_le(buf, queue_names.length())
     push_i32_le(buf, g_msg_counter)
@@ -215,6 +229,10 @@ pub fn mq_load(path: String) -> int {
 
     // META
     let timestamp: int = read_i64_le(buf, 6)
+    // Se decodificaba y se tiraba. Ahora sobrevive: INFO lo publica como
+    // last_save_epoch, que es lo que hace verificable que el campo diga la
+    // verdad — un campo que nadie lee vuelve a pudrirse.
+    g_snapshot_epoch = timestamp
     let num_queues: int = read_i32_le(buf, 14)
     let saved_counter: int = read_i32_le(buf, 18)
     g_msg_counter = saved_counter

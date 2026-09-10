@@ -24,6 +24,12 @@ var g_ack_timeout: int = 30           // seconds before redelivery (default 30s)
 var g_msg_counter: int = 0            // monotonic message ID counter
 var g_changes_since_save: int = 0
 var g_last_save_time: int = 0
+// Epoch (segundos, time_epoch()) del ultimo snapshot escrito o cargado; 0 si
+// nunca hubo uno. OJO: dominio distinto de g_last_save_time, que es el reloj
+// MONOTONICO y solo sirve para medir el intervalo entre saves dentro de este
+// proceso. Este de aca viaja al disco y sobrevive reinicios, asi que tiene que
+// ser reloj de pared. Lo expone INFO como last_save_epoch.
+var g_snapshot_epoch: int = 0
 var g_save_path: String = "queue.ndb"
 
 // Stats
@@ -45,11 +51,28 @@ fn ensure_mtx() {
     return 0
 }
 
-// Generate unique message ID: monotonic counter as hex string
+// Genera un msg_id unico: "<epoch>_<contador>".
+//
+// La UNICIDAD la da g_msg_counter, que se persiste en el snapshot y se
+// restaura al cargar (persist.nx), asi que es estrictamente creciente incluso
+// cruzando reinicios. El prefijo es diagnostico: sirve para saber CUANDO se
+// encolo un mensaje al mirar un id suelto en un log.
+//
+// Usaba time_us() —monotonico desde el arranque de la maquina— y el comentario
+// prometia "unique + sortable". Las dos mitades eran enganosas: como prefijo de
+// diagnostico un uptime no dice nada ("43219 segundos despues de algun
+// arranque"), y tras un reinicio volvia a empezar cerca de cero, asi que los
+// ids nuevos quedaban numericamente ANTES que los recuperados del snapshot.
+// Corregido el 2026-09-10 a time_epoch().
+//
+// Sobre "sortable": el orden FIFO lo mantiene el array de ids de cada cola, no
+// una comparacion de ids; y como strings, "..._10" ordena antes que "..._5", de
+// modo que la promesa lexicografica nunca fue cierta con ningun reloj. Nada en
+// el codigo parsea ni ordena un msg_id — es opaco para el cliente, que solo lo
+// devuelve en ACK/NACK.
 fn gen_msg_id() -> String {
     g_msg_counter = g_msg_counter + 1
-    let ts: int = time_us()
-    // Format: timestamp_counter (unique + sortable)
+    let ts: int = time_epoch()
     return int_to_string(ts) + "_" + int_to_string(g_msg_counter)
 }
 

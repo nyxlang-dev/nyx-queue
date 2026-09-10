@@ -179,6 +179,13 @@ pub fn dispatch_command(cmd: Array, fd: int) -> String {
         sb.append("ack_timeout:")
         sb.append(int_to_string(g_ack_timeout))
         sb.append("\r\n")
+        // Epoch del ultimo snapshot escrito o cargado (0 = todavia ninguno).
+        // El .ndb ya guardaba este dato en su META y nadie lo leia; publicarlo
+        // acá es lo que lo vuelve verificable — y es lo que un operador quiere
+        // saber ante "cuanto perderia si se cae ahora".
+        sb.append("last_save_epoch:")
+        sb.append(int_to_string(g_snapshot_epoch))
+        sb.append("\r\n")
         let info: String = sb.to_string()
         return resp_bulk_string(info)
     }
