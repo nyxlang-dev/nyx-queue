@@ -1,7 +1,7 @@
 # CAPABILITIES — índice de la stdlib de Nyx
 
-<!-- nyx-version: 0.41.0 -->
-<!-- nyx-stdlib: 1408603158-2164490 -->
+<!-- nyx-version: 0.44.0 -->
+<!-- nyx-stdlib: 3955628581-2217602 -->
 > Auto-generado por `nyx capabilities` desde la stdlib instalada — siempre en sync con tu versión.
 > Es el índice de QUÉ EXISTE: antes de escribir una función, busca aquí si un módulo ya lo hace,
 > impórtalo y úsalo. NO leas el fuente de `std/`. Ver `AGENTS.md` para cómo escribir Nyx.
@@ -242,7 +242,7 @@ Tipos (1) y métodos (0):
 
 ### `std/http`
 
-`import "std/http"` — 35 funciones:
+`import "std/http"` — 36 funciones:
 
 - `pub fn http_status_text(code: int) -> String`
 - `pub fn http_response(status: int, body: String) -> String`
@@ -270,6 +270,7 @@ Tipos (1) y métodos (0):
 - `pub fn http_status(resp: Array) -> int`
 - `pub fn http_body(resp: Array) -> String`
 - `pub fn http_headers(resp: Array) -> Array<String>`
+- `pub fn http_header_name_eq(a: String, b: String) -> bool`
 - `pub fn http_find_header(headers: Array, name: String) -> String`
 - `pub fn http_find_headers(headers: Array, name: String) -> Array<String>`
 - `pub fn http_parse_request(client_fd: int) -> Array`
@@ -366,10 +367,14 @@ Tipos (1) y métodos (0):
 
 ### `std/serve`
 
-`import "std/serve"` — 38 funciones:
+`import "std/serve"` — 42 funciones:
 
 - `pub fn app_ws(pattern: String, handler: Fn(Array) -> int)`
 - `pub fn serve_ws(handler: Fn(Array) -> int)`
+- `pub fn response_chunks(status: int, tipo: String, siguiente: Fn() -> String) -> Response`
+- `pub fn response_chunks_len(status: int, tipo: String, largo: int, siguiente: Fn() -> String) -> Response`
+- `pub fn response_from_stream(s: HttpStream) -> Response` — Reenvía la respuesta de un origen (un HttpStream de std/http) sin juntarla en memoria: el servidor lee un trozo, lo escribe al cliente y pide el siguiente, así que un cuerpo de cientos de MiB cuesta lo mismo que uno de pocos KiB. Copia el status, el Content-Type (application/octet-stream si el origen no trae), y Content-Disposition, ETag, Last-Modified, Cache-Control, Expires, Content-Language, Location y Retry-After. Con un Content-Length válido del origen sale con ese Content-Length (los bytes que entrega read() son exactamente esos); sin él, con Transfer-Encoding: chunked. El stream se cierra al terminar el cuerpo, si el origen falla a mitad (la conexión con el cliente se corta), si el cliente se va y si la respuesta se descarta sin enviar el cuerpo (HEAD, un after-hook que cambia el status). Un 3xx reenvía solo Location; un 204/304 no lleva cuerpo.
+- `pub fn response_file(ruta: String, tipo: String, nombre: String) -> Response` — Sirve un archivo del disco en bloques de 16 KiB, con Content-Length igual a su tamaño: el RSS del servidor no depende del tamaño del archivo. `tipo` es el Content-Type ("" = detectarlo por la extensión con detect_mime_type). `nombre` no vacío agrega Content-Disposition: attachment; filename="nombre" (se descartan CR/LF y otros caracteres de control, y se escapan comillas y barras); vacío = sin esa cabecera. Un archivo que no existe, no es regular o no se puede leer da una Response 404. El archivo se abre al pedir el primer bloque y se cierra al terminar, al fallar, al cortarse la conexión y si la respuesta se descarta; si cambia de tamaño mientras se sirve, la conexión se corta (el largo ya se anunció). No valida la ruta: quien la arma desde un pedido debe rechazar `..`.
 - `pub fn serve_idle_connections() -> int`
 - `pub fn serve_on_shutdown(handler: Fn)`
 - `pub fn serve_app(app: App, port: int, workers: int) -> int`
@@ -874,9 +879,10 @@ Tipos (4) y métodos (1):
 
 ### `std/serial`
 
-`import "std/serial"` — 8 funciones:
+`import "std/serial"` — 9 funciones:
 
 - `pub fn try_serial_open(path: String, baud: int, data_bits: int, parity: String, stop_bits: int) -> Result<SerialPort, Error>`
+- `pub fn try_serial_from_fd(fd: int, label: String) -> Result<SerialPort, String>` — Adopta un fd que abrió otro como puerto serie (android-lib D10): si es un tty le aplica la configuración de serial_open (raw, 8N1, sin control de flujo, DTR; conserva la velocidad que ya tenía); si no lo es (pipe, socketpair, el puente de Bluetooth/USB de Kotlin) no toca termios. `label` queda como `path` en los mensajes de error. Nyx pasa a ser el dueño y lo cierra con try_serial_close; desde Kotlin pasarlo con ParcelFileDescriptor.detachFd(). En Windows siempre es Err.
 - `pub fn try_serial_write(p: SerialPort, datos: String) -> Result<int, Error>`
 - `pub fn try_serial_read(p: SerialPort, max: int, timeout_ms: int) -> Result<String, Error>`
 - `pub fn try_serial_read_until(p: SerialPort, fin: int, max: int, timeout_ms: int) -> Result<String, Error>`
@@ -1073,15 +1079,41 @@ Tipos (6) y métodos (0):
 
 ### `std/http2`
 
-`import "std/http2"` — 3 funciones:
+`import "std/http2"` — 25 funciones:
 
 - `pub fn h2_check_upgrade(request: String) -> bool`
 - `pub fn h2_send_response(fd: int, stream_id: int, status: int, resp_headers: Array, body: String) -> int`
+- `pub fn h2_session_new(max_body: int) -> int`
+- `pub fn h2_feed(sess: int, data: String) -> bool`
+- `pub fn h2_next_event(sess: int) -> Array`
+- `pub fn h2_event_kind(ev: Array) -> int`
+- `pub fn h2_event_stream(ev: Array) -> int`
+- `pub fn h2_event_request(ev: Array) -> H2Request`
+- `pub fn h2_header(headers: Array, name: String) -> String`
+- `pub fn h2_respond_start(sess: int, stream: int, status: int, headers: Array) -> int`
+- `pub fn h2_send_data(sess: int, stream: int, data: String) -> int`
+- `pub fn h2_end(sess: int, stream: int) -> int`
+- `pub fn h2_respond(sess: int, stream: int, status: int, headers: Array, body: String) -> int`
+- `pub fn h2_cancel(sess: int, stream: int) -> int`
+- `pub fn h2_pending(sess: int, stream: int) -> int`
+- `pub fn h2_stream_open(sess: int, stream: int) -> bool`
+- `pub fn h2_take_output(sess: int) -> String`
+- `pub fn h2_closed(sess: int) -> bool`
+- `pub fn h2_goaway(sess: int) -> int`
+- `pub fn h2_open_streams(sess: int) -> int`
+- `pub fn h2_wake_signal(wfd: int) -> int`
+- `pub fn h2_wake_drain(rfd: int) -> int`
+- `pub fn h2_serve_tls_conn(tls: int, cb: Fn(String, String, Array, String) -> Array) -> int`
 - `pub fn h2_serve(port: int, num_workers: int, cb: Fn) -> int`
+- `pub fn h2_serve_tls(port: int, num_workers: int, cert: String, key: String, cb: Fn) -> int`
+
+Tipos (1) y métodos (0):
+
+- `pub struct H2Request`
 
 ### `std/net`
 
-`import "std/net"` — 29 funciones:
+`import "std/net"` — 30 funciones:
 
 - `pub fn try_tcp_connect(host: String, port: int) -> Result<int, Error>`
 - `pub fn try_tcp_connect_ms(host: String, port: int, timeout_ms: int) -> Result<int, Error>`
@@ -1098,6 +1130,7 @@ Tipos (6) y métodos (0):
 - `pub fn try_tcp_read_exact(fd: int, n: int) -> Result<String, Error>`
 - `pub fn try_tcp_read_timed(fd: int, max_bytes: int, timeout_ms: int) -> Result<String, Error>`
 - `pub fn try_tcp_shutdown(fd: int, mode: int) -> Result<int, Error>` — La forma correcta de despertar un recv() bloqueado en OTRO thread — tcp_close NO lo despierta y el fd reciclado puede robarle bytes a una conexión nueva; patrón: el no-dueño hace shutdown, solo el reader dueño hace close.
+- `pub fn try_socket_from_fd(fd: int) -> Result<int, String>` — Adopta un fd de socket que abrió otro (android-lib D10): comprueba con fstat que sea un socket, lo deja no bloqueante y devuelve el MISMO fd, que ya sirve para tcp_read/tcp_write/tcp_close. Desde ahí Nyx es el dueño y lo cierra; desde Kotlin pasarlo con ParcelFileDescriptor.detachFd(). Err si no es un socket (archivo, pipe) o fd inválido. En Windows siempre es Err (un SOCKET no es un fd).
 - `pub fn try_tcp_set_timeout(fd: int, secs: int) -> Result<int, Error>`
 - `pub fn try_getpeername(fd: int) -> Result<String, Error>`
 - `pub fn try_local_port(fd: int) -> Result<int, Error>`
@@ -1213,7 +1246,7 @@ Tipos (3) y métodos (0):
 
 ### `std/sync`
 
-`import "std/sync"` — 22 funciones:
+`import "std/sync"` — 23 funciones:
 
 - `pub fn wg_new() -> WaitGroup` — Create a new WaitGroup with count 0.
 - `pub fn wg_add(wg: WaitGroup, delta: int)` — Add delta to WaitGroup counter. Call before spawning goroutines.
@@ -1237,6 +1270,7 @@ Tipos (3) y métodos (0):
 - `pub fn counter_dec(c: AtomicCounter) -> int` — Atomically decrement and return new value.
 - `pub fn counter_get(c: AtomicCounter) -> int` — Get current value atomically.
 - `pub fn counter_set(c: AtomicCounter, val: int)` — Set value atomically.
+- `pub fn thread_detach(tid: int) -> bool`
 
 Tipos (5) y métodos (0):
 
@@ -1342,7 +1376,7 @@ Tipos (4) y métodos (0):
 
 ### `std/tls`
 
-`import "std/tls"` — 32 funciones:
+`import "std/tls"` — 35 funciones:
 
 - `pub fn tls_version(h: int) -> String`
 - `pub fn tls_cipher(h: int) -> String`
@@ -1376,6 +1410,9 @@ Tipos (4) y métodos (0):
 - `pub fn try_tls_connect_cas(host: String, port: int, verify_mode: int, connect_ms: int, cas_extra: String) -> Result<int, Error>`
 - `pub fn try_tls_connect_mtls(host: String, port: int, verify_mode: int, connect_ms: int, cas_extra: String, client_cert_pem: String, client_key_pem: String) -> Result<int, Error>`
 - `pub fn try_tls_read(h: int, max_bytes: int, timeout_ms: int) -> Result<String, Error>`
+- `pub fn tls_server_alpn(protos: String) -> bool`
+- `pub fn tls_alpn(h: int) -> String`
+- `pub fn tls_wait_any(h: int, fds: Array, timeout_ms: int) -> Array`
 
 ### `std/webpushcrypto`
 
@@ -1790,6 +1827,15 @@ Tipos (1) y métodos (5):
 
 ## Memoria
 
+### `std/gc`
+
+`import "std/gc"` — 4 funciones:
+
+- `pub fn gc_collect()`
+- `pub fn gc_release()`
+- `pub fn gc_heap_bytes() -> int`
+- `pub fn gc_free_bytes() -> int`
+
 ### `std/arena`
 
 `import "std/arena"` — 8 funciones:
@@ -1869,7 +1915,7 @@ Tipos (1) y métodos (0):
 
 ### `std/process`
 
-`import "std/process"` — 17 funciones:
+`import "std/process"` — 18 funciones:
 
 - `pub fn spawn_opts() -> SpawnOpts`
 - `pub fn try_spawn(argv: Array, opts: SpawnOpts) -> Result<Child, Error>`
@@ -1887,6 +1933,7 @@ Tipos (1) y métodos (0):
 - `pub fn find_program(name: String) -> Option<String>`
 - `pub fn host_arch() -> String`
 - `pub fn host_os() -> String`
+- `pub fn exe_path() -> String`
 - `pub fn cpu_count() -> int`
 
 Tipos (4) y métodos (0):
