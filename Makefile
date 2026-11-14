@@ -1,7 +1,7 @@
 # Makefile — nyx-queue-stack
 # El toolchain Nyx vive fuera de este repo; se apunta vía NYX_HOME.
 
-NYX_HOME ?= /home/admin/nyx/lang
+NYX_HOME ?= /home/admin/nyxlang
 export NYX_HOME
 
 .PHONY: build test-queue clean
